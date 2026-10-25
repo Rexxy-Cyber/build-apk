@@ -1,0 +1,138 @@
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "URL ZIP project Flutter (GitHub Release asset)"
+        required: true
+        type: string
+      tag:
+        description: "Tag build"
+        required: true
+        type: string
+      build_type:
+        description: "Mode build"
+        required: true
+        default: "release"
+        type: choice
+        options:
+          - debug
+          - release
+      release_url:
+        description: "URL ZIP project (compatibility)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: flutter-apk-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build APK (${{ inputs.build_type }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout builder workflow
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Download Flutter project ZIP
+        env:
+          PROJECT_URL: ${{ inputs.url || inputs.release_url }}
+        run: |
+          set -euo pipefail
+          test -n "$PROJECT_URL" || { echo "::error::URL ZIP project kosong"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/flutter-source" "$RUNNER_TEMP/flutter-unpacked"
+          curl --fail --location --retry 3 --retry-delay 2 \
+            --connect-timeout 20 --max-time 300 \
+            "$PROJECT_URL" -o "$RUNNER_TEMP/flutter-source/project.zip"
+          unzip -q "$RUNNER_TEMP/flutter-source/project.zip" -d "$RUNNER_TEMP/flutter-unpacked"
+
+          # Cari pubspec.yaml meskipun ZIP punya satu folder induk.
+          PUBSPEC="$(find "$RUNNER_TEMP/flutter-unpacked" -type f -name pubspec.yaml -print -quit)"
+          test -n "$PUBSPEC" || { echo "::error::pubspec.yaml tidak ditemukan di ZIP"; exit 1; }
+          PROJECT_DIR="$(dirname "$PUBSPEC")"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Project Flutter ditemukan: $PROJECT_DIR"
+
+      - name: Resolve Flutter dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter pub get
+
+      - name: Build Debug APK
+        if: inputs.build_type == 'debug'
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter build apk --debug
+
+      - name: Build optimized Release APK
+        if: inputs.build_type == 'release'
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter build apk --release
+
+      - name: Collect APK
+        env:
+          BUILD_TYPE: ${{ inputs.build_type }}
+          BUILD_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/apk-output"
+          APK_DIR="$PROJECT_DIR/build/app/outputs/flutter-apk"
+          if [ ! -d "$APK_DIR" ]; then
+            echo "::error::Folder output APK tidak ditemukan: $APK_DIR"
+            find "$PROJECT_DIR/build" -type f -name '*.apk' -print || true
+            exit 1
+          fi
+
+          # Copy APK yang cocok dengan mode terpilih; fallback ke APK pertama jika
+          # nama output berbeda pada versi Flutter/project tertentu.
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            find "$APK_DIR" -maxdepth 1 -type f -name '*debug*.apk' -exec cp {} "$GITHUB_WORKSPACE/apk-output/" \;
+          else
+            find "$APK_DIR" -maxdepth 1 -type f -name '*release*.apk' -exec cp {} "$GITHUB_WORKSPACE/apk-output/" \;
+          fi
+
+          if ! compgen -G "$GITHUB_WORKSPACE/apk-output/*.apk" > /dev/null; then
+            find "$PROJECT_DIR/build" -type f -name '*.apk' -exec cp {} "$GITHUB_WORKSPACE/apk-output/" \;
+          fi
+          test -n "$(find "$GITHUB_WORKSPACE/apk-output" -maxdepth 1 -type f -name '*.apk' -print -quit)" \
+            || { echo "::error::Build selesai tetapi APK tidak ditemukan"; exit 1; }
+
+          # Nama konsisten, sekaligus tetap mendukung output lebih dari satu APK.
+          cd "$GITHUB_WORKSPACE/apk-output"
+          for file in *.apk; do
+            [ -f "$file" ] || continue
+            case "$file" in
+              *debug*.apk) suffix="debug" ;;
+              *release*.apk) suffix="release" ;;
+              *) suffix="$BUILD_TYPE" ;;
+            esac
+            mv "$file" "app-${BUILD_TAG}-${suffix}.apk"
+          done
+          ls -lh
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.tag }}
+          path: apk-output/*.apk
+          if-no-files-found: error
+          retention-days: 7
