@@ -1,138 +1,211 @@
-name: Build Flutter APK
+
+name: Build Flutter APK (Fallback Worker)
 
 on:
   workflow_dispatch:
     inputs:
-      url:
-        description: "URL ZIP project Flutter (GitHub Release asset)"
+      jobId:
+        description: "Job ID from Bot"
         required: true
         type: string
-      tag:
-        description: "Tag build"
+      userId:
+        description: "User ID"
         required: true
         type: string
-      build_type:
-        description: "Mode build"
+      payload:
+        description: "Build Payload (JSON)"
         required: true
-        default: "release"
-        type: choice
-        options:
-          - debug
-          - release
-      release_url:
-        description: "URL ZIP project (compatibility)"
-        required: false
         type: string
 
 permissions:
   contents: read
-  actions: write
+  actions: read
 
 concurrency:
-  group: flutter-apk-${{ github.run_id }}
+  group: flutter-build-${{ github.event.inputs.jobId }}
   cancel-in-progress: false
 
 jobs:
   build:
-    name: Build APK (${{ inputs.build_type }})
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 45
 
     steps:
-      - name: Checkout builder workflow
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Java
-        uses: actions/setup-java@v4
+      - name: Setup Java
+        uses: actions/setup-java@v5
         with:
-          distribution: temurin
+          distribution: zulu
           java-version: "17"
-          cache: gradle
 
-      - name: Set up Flutter
+      - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
+          flutter-version: "3.38.0"
           channel: stable
           cache: true
 
-      - name: Download Flutter project ZIP
+      - name: Parse Build Payload
         env:
-          PROJECT_URL: ${{ inputs.url || inputs.release_url }}
+          BUILD_PAYLOAD: ${{ github.event.inputs.payload }}
+        shell: bash
         run: |
           set -euo pipefail
-          test -n "$PROJECT_URL" || { echo "::error::URL ZIP project kosong"; exit 1; }
-          mkdir -p "$RUNNER_TEMP/flutter-source" "$RUNNER_TEMP/flutter-unpacked"
-          curl --fail --location --retry 3 --retry-delay 2 \
-            --connect-timeout 20 --max-time 300 \
-            "$PROJECT_URL" -o "$RUNNER_TEMP/flutter-source/project.zip"
-          unzip -q "$RUNNER_TEMP/flutter-source/project.zip" -d "$RUNNER_TEMP/flutter-unpacked"
+          printf '%s' "$BUILD_PAYLOAD" > payload.json
 
-          # Cari pubspec.yaml meskipun ZIP punya satu folder induk.
-          PUBSPEC="$(find "$RUNNER_TEMP/flutter-unpacked" -type f -name pubspec.yaml -print -quit)"
-          test -n "$PUBSPEC" || { echo "::error::pubspec.yaml tidak ditemukan di ZIP"; exit 1; }
-          PROJECT_DIR="$(dirname "$PUBSPEC")"
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Project Flutter ditemukan: $PROJECT_DIR"
+          ASSET_URL="$(jq -er '.zipAssetUrl // .url // empty' payload.json)"
+          BUILD_TYPE="$(jq -r '.buildType // .build_type // .mode // .payload.buildType // "release"' payload.json | tr '[:upper:]' '[:lower:]')"
 
-      - name: Resolve Flutter dependencies
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: flutter pub get
+          case "$BUILD_TYPE" in
+            debug|release) ;;
+            *)
+              echo "::error::Build mode tidak valid: $BUILD_TYPE"
+              exit 1
+              ;;
+          esac
 
-      - name: Build Debug APK
-        if: inputs.build_type == 'debug'
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: flutter build apk --debug
-
-      - name: Build optimized Release APK
-        if: inputs.build_type == 'release'
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: flutter build apk --release
-
-      - name: Collect APK
-        env:
-          BUILD_TYPE: ${{ inputs.build_type }}
-          BUILD_TAG: ${{ inputs.tag }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/apk-output"
-          APK_DIR="$PROJECT_DIR/build/app/outputs/flutter-apk"
-          if [ ! -d "$APK_DIR" ]; then
-            echo "::error::Folder output APK tidak ditemukan: $APK_DIR"
-            find "$PROJECT_DIR/build" -type f -name '*.apk' -print || true
+          if [ -z "$ASSET_URL" ]; then
+            echo "::error::URL ZIP tidak ditemukan dalam payload."
             exit 1
           fi
 
-          # Copy APK yang cocok dengan mode terpilih; fallback ke APK pertama jika
-          # nama output berbeda pada versi Flutter/project tertentu.
-          if [ "$BUILD_TYPE" = "debug" ]; then
-            find "$APK_DIR" -maxdepth 1 -type f -name '*debug*.apk' -exec cp {} "$GITHUB_WORKSPACE/apk-output/" \;
+          echo "BUILD_TYPE=$BUILD_TYPE" >> "$GITHUB_ENV"
+          echo "ASSET_URL=$ASSET_URL" >> "$GITHUB_ENV"
+          echo "Mode build: $BUILD_TYPE"
+
+      - name: Download Project
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p project
+
+          if [[ "$ASSET_URL" == *"api.github.com"* ]]; then
+            curl --fail --location --retry 3 \
+              --retry-delay 2 --connect-timeout 30 --max-time 600 \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/octet-stream" \
+              -o project.zip "$ASSET_URL"
           else
-            find "$APK_DIR" -maxdepth 1 -type f -name '*release*.apk' -exec cp {} "$GITHUB_WORKSPACE/apk-output/" \;
+            curl --fail --location --retry 3 \
+              --retry-delay 2 --connect-timeout 30 --max-time 600 \
+              -o project.zip "$ASSET_URL"
           fi
 
-          if ! compgen -G "$GITHUB_WORKSPACE/apk-output/*.apk" > /dev/null; then
-            find "$PROJECT_DIR/build" -type f -name '*.apk' -exec cp {} "$GITHUB_WORKSPACE/apk-output/" \;
-          fi
-          test -n "$(find "$GITHUB_WORKSPACE/apk-output" -maxdepth 1 -type f -name '*.apk' -print -quit)" \
-            || { echo "::error::Build selesai tetapi APK tidak ditemukan"; exit 1; }
+          unzip -q project.zip -d project
 
-          # Nama konsisten, sekaligus tetap mendukung output lebih dari satu APK.
-          cd "$GITHUB_WORKSPACE/apk-output"
-          for file in *.apk; do
-            [ -f "$file" ] || continue
-            case "$file" in
-              *debug*.apk) suffix="debug" ;;
-              *release*.apk) suffix="release" ;;
-              *) suffix="$BUILD_TYPE" ;;
-            esac
-            mv "$file" "app-${BUILD_TAG}-${suffix}.apk"
+          PUBSPEC="$(find project -maxdepth 6 -type f -name pubspec.yaml -print -quit)"
+          if [ -z "$PUBSPEC" ]; then
+            echo "::error::pubspec.yaml tidak ditemukan dalam ZIP."
+            exit 1
+          fi
+
+          PROJECT_ROOT="$(dirname "$PUBSPEC")"
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+          echo "Project ditemukan: $PROJECT_ROOT"
+
+      # Cache dependency downloads between workflow runs. This avoids fetching
+      # the same Dart packages and Gradle artifacts on every APK build.
+      - name: Cache Flutter and Gradle Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-flutter-3.38.0-gradle-${{ hashFiles('project/**/pubspec.lock', 'project/**/build.gradle', 'project/**/build.gradle.kts', 'project/**/settings.gradle', 'project/**/settings.gradle.kts', 'project/**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-flutter-3.38.0-gradle-
+
+      - name: Install Flutter Dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+          flutter pub get
+
+      # Cache NDK itself: downloading/installing the ~large NDK on every run
+      # can waste several minutes. Restore it before the fallback installer.
+      - name: Cache Android NDK
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ANDROID_HOME }}/ndk/27.0.12077973
+          key: ${{ runner.os }}-android-ndk-27.0.12077973-v1
+
+      - name: Install Android NDK (only if cache miss)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -d "$ANDROID_HOME/ndk/27.0.12077973" ] && [ -f "$ANDROID_HOME/ndk/27.0.12077973/source.properties" ]; then
+            echo "NDK 27.0.12077973 sudah tersedia dari cache; melewati download."
+            exit 0
+          fi
+
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager -print -quit)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager tidak ditemukan"
+            exit 1
+          fi
+
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          for attempt in 1 2 3; do
+            echo "Instalasi NDK percobaan $attempt dari 3"
+            if "$SDKMANAGER" --install "ndk;27.0.12077973"; then break; fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Instalasi NDK gagal setelah 3 percobaan"
+              exit 1
+            fi
+            sleep 5
           done
-          ls -lh
 
-      - name: Upload APK artifact
+          if [ ! -f "$ANDROID_HOME/ndk/27.0.12077973/source.properties" ]; then
+            echo "::error::NDK tidak lengkap setelah instalasi"
+            exit 1
+          fi
+
+      - name: Build APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+
+          echo "Memulai Flutter build mode: $BUILD_TYPE"
+          if [ "$BUILD_TYPE" = "debug" ]; then
+            # Debug: prioritize iteration speed; keep symbols and skip release shrinking.
+            flutter build apk --debug --no-pub
+          else
+            # Release: tree-shake unused icon fonts to reduce the distributable APK.
+            flutter build apk --release --no-pub --tree-shake-icons
+          fi
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK_PATH="$(find "$PROJECT_ROOT/build/app/outputs/flutter-apk" \
+            -maxdepth 1 -type f \
+            -name "app-${BUILD_TYPE}.apk" -print -quit)"
+
+          if [ -z "$APK_PATH" ] || [ ! -s "$APK_PATH" ]; then
+            echo "::error::APK mode $BUILD_TYPE tidak ditemukan atau kosong"
+            find "$PROJECT_ROOT/build" -type f -name "*.apk" 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "APK_PATH=$APK_PATH" >> "$GITHUB_ENV"
+          echo "APK berhasil diverifikasi: $APK_PATH"
+          ls -lh "$APK_PATH"
+
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: apk-${{ inputs.tag }}
-          path: apk-output/*.apk
+          name: apk-${{ github.event.inputs.jobId }}
+          path: ${{ env.APK_PATH }}
           if-no-files-found: error
-          retention-days: 7
+          compression-level: 0
+          retention-days: 2
